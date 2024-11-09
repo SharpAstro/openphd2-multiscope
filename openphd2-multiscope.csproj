@@ -9,7 +9,8 @@
   </PropertyGroup>
 
   <ItemGroup>
-    <PackageReference Include="Astap.Lib" Version="1.5.3391" />
+    <PackageReference Include="Microsoft.Extensions.Hosting" Version="8.0.1" />
+    <PackageReference Include="TianWen.Lib" Version="1.5.3651" />
   </ItemGroup>
 
 </Project>

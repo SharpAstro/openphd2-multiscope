@@ -1,11 +1,30 @@
-﻿using Astap.Lib.Devices;
-using Astap.Lib.Devices.Guider;
+﻿using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Hosting;
+using Microsoft.Extensions.Logging;
 using System.Collections.Concurrent;
 using System.Net;
 using System.Net.Sockets;
 using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization;
+using TianWen.Lib.Devices;
+using TianWen.Lib.Devices.Guider;
+using TianWen.Lib.Extensions;
+using TianWen.Lib.Sequencing;
+
+var builder = Host.CreateApplicationBuilder(new HostApplicationBuilderSettings { Args = args, DisableDefaults = true });
+builder.Services
+    .AddLogging(builder =>
+    {
+        builder.AddSimpleConsole(options =>
+        {
+            options.SingleLine = true;
+            options.IncludeScopes = false;
+        });
+    })
+    .AddExternal()
+    .AddPHD2()
+    .AddDeviceManager();
 
 var cts = new CancellationTokenSource();
 var startListenerSem = new SemaphoreSlim(0);
@@ -14,15 +33,21 @@ var serializerOptions = new JsonSerializerOptions { WriteIndented = false };
 var clients = new ConcurrentDictionary<EndPoint, NetworkStream>();
 var ditherReceived = 0;
 
-var guiderDevice = new GuiderDevice(DeviceType.PHD2, "localhost/1", "");
-if (!guiderDevice.TryInstantiateDriver<IGuider>(out var guiderDriver))
-{
-    Console.Error.WriteLine("Could not connect to PHD2 on localhost:4400");
-    Environment.Exit(-1);
-}
+using var host = builder.Build();
 
-guiderDriver.Connected = true;
-guiderDriver.GuiderStateChangedEvent += GuiderDriver_GuiderStateChangedEvent;
+var deviceManager = host.Services.GetRequiredService<IDeviceManager<DeviceBase>>();
+
+var guider = new Guider(new GuiderDevice(DeviceType.PHD2, "localhost/1", ""), host.Services.GetRequiredService<IExternal>());
+
+if (guider.Driver.CanAsyncConnect)
+{
+    await guider.Driver.ConnectAsync();
+}
+else
+{
+    guider.Driver.Connect();
+}
+guider.Driver.GuiderStateChangedEvent += GuiderDriver_GuiderStateChangedEvent;
 
 void GuiderDriver_GuiderStateChangedEvent(object? sender, GuiderStateChangedEventArgs e)
 {
@@ -48,7 +73,7 @@ void GuiderDriver_GuiderStateChangedEvent(object? sender, GuiderStateChangedEven
         switch (e.Event)
         {
             case "GuideStep":
-                if (guiderDriver.GetStats() is { LastRaErr: { } ra, LastDecErr: { } dec } stats)
+                if (guider.Driver.GetStats() is { LastRaErr: { } ra, LastDecErr: { } dec } stats)
                 {
                     BroadcastEvent(new GuideStepEvent(ra, dec));
                 }
@@ -63,14 +88,14 @@ void GuiderDriver_GuiderStateChangedEvent(object? sender, GuiderStateChangedEven
                 break;
 
             case "Settling":
-                if (guiderDriver.TryGetSettleProgress(out var settleProgress))
+                if (guider.Driver.TryGetSettleProgress(out var settleProgress))
                 {
                     BroadcastEvent(new SettlingEvent(settleProgress.Distance, settleProgress.Time, settleProgress.SettleTime, settleProgress.StarLocked));
                 }
                 break;
 
             case "SettleDone":
-                if (guiderDriver.TryGetSettleProgress(out settleProgress))
+                if (guider.Driver.TryGetSettleProgress(out settleProgress))
                 {
                     BroadcastEvent(new SettleDoneEvent(settleProgress.Status, settleProgress.Error ?? "", 0, 0));
                 }
@@ -111,7 +136,7 @@ void Worker(object? obj)
     using var stream = client.GetStream();
     using var reader = new StreamReader(stream, Encoding.UTF8, leaveOpen: true);
 
-    var version = guiderDriver.DriverInfo?.Split(' ', StringSplitOptions.RemoveEmptyEntries).Skip(1) ?? [];
+    var version = guider.Driver.DriverInfo?.Split(' ', StringSplitOptions.RemoveEmptyEntries).Skip(1) ?? [];
 
     SendEvent(stream, new VersionEvent(version.FirstOrDefault() ?? "Unknown", version.LastOrDefault() ?? "Unknown"), endPoint);
 
@@ -160,7 +185,7 @@ void Worker(object? obj)
                     if (Interlocked.CompareExchange(ref ditherReceived, 0, count) == count)
                     {
                         Console.WriteLine("All {0} connected clients issued a dither command, actually dither now", count);
-                        guiderDriver.Dither(@params.Amount, @params.Settle.Pixels, @params.Settle.Time, @params.Settle.Timeout, @params.RaOnly);
+                        guider.Driver.Dither(@params.Amount, @params.Settle.Pixels, @params.Settle.Time, @params.Settle.Timeout, @params.RaOnly);
                     }
                     else
                     {
