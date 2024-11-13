@@ -26,30 +26,39 @@ builder.Services
     .AddPHD2()
     .AddDeviceManager();
 
-var cts = new CancellationTokenSource();
 var startListenerSem = new SemaphoreSlim(0);
 string? appState = null;
 var serializerOptions = new JsonSerializerOptions { WriteIndented = false };
-var clients = new ConcurrentDictionary<EndPoint, NetworkStream>();
 var ditherReceived = 0;
 
 using var host = builder.Build();
 
-var deviceManager = host.Services.GetRequiredService<IDeviceManager<DeviceBase>>();
+await host.StartAsync();
 
-var guider = new Guider(new GuiderDevice(DeviceType.PHD2, "localhost/1", ""), host.Services.GetRequiredService<IExternal>());
+var services = host.Services;
+var external = services.GetRequiredService<IExternal>();
+var deviceManager = services.GetRequiredService<ICombinedDeviceManager>();
+var lifetime = services.GetRequiredService<IHostApplicationLifetime>();
+using var cts = CancellationTokenSource.CreateLinkedTokenSource(lifetime.ApplicationStopping);
+var clients = new ConcurrentDictionary<EndPoint, (Task WorkerTask, NetworkStream Stream, TcpClient Client)>();
+var CRLF = "\r\n"u8.ToArray();
 
-if (guider.Driver.CanAsyncConnect)
+await deviceManager.DiscoverAsync(cts.Token);
+
+var device = deviceManager.RegisteredDevices(DeviceType.DedicatedGuiderSoftware).FirstOrDefault();
+Guider guider;
+if (device is GuiderDevice guiderDevice)
 {
-    await guider.Driver.ConnectAsync();
+    guider = new Guider(guiderDevice, external);
+    await guider.Driver.ConnectAsync(cts.Token);
+    guider.Driver.GuiderStateChangedEvent += GuiderDriver_GuiderStateChangedEvent;
 }
 else
 {
-    guider.Driver.Connect();
+    throw new InvalidOperationException("Could not connect to guider");
 }
-guider.Driver.GuiderStateChangedEvent += GuiderDriver_GuiderStateChangedEvent;
 
-void GuiderDriver_GuiderStateChangedEvent(object? sender, GuiderStateChangedEventArgs e)
+async void GuiderDriver_GuiderStateChangedEvent(object? sender, GuiderStateChangedEventArgs e)
 {
     if (e.AppState is { } state)
     {
@@ -73,31 +82,32 @@ void GuiderDriver_GuiderStateChangedEvent(object? sender, GuiderStateChangedEven
         switch (e.Event)
         {
             case "GuideStep":
-                if (guider.Driver.GetStats() is { LastRaErr: { } ra, LastDecErr: { } dec } stats)
+                if (await guider.Driver.GetStatsAsync(cts.Token) is { LastRaErr: { } ra, LastDecErr: { } dec } stats)
                 {
-                    BroadcastEvent(new GuideStepEvent(ra, dec));
+                    await BroadcastEventAsync(new GuideStepEvent(ra, dec), cts.Token);
                 }
                 break;
 
             case "GuidingDithered":
-                BroadcastEvent(new GuidingDitheredEvent());
+                await BroadcastEventAsync(new GuidingDitheredEvent(), cts.Token);
                 break;
 
             case "SettleBegin":
-                BroadcastEvent(new SettleBeginEvent());
+                await BroadcastEventAsync(new SettleBeginEvent(), cts.Token);
                 break;
 
             case "Settling":
-                if (guider.Driver.TryGetSettleProgress(out var settleProgress))
-                {
-                    BroadcastEvent(new SettlingEvent(settleProgress.Distance, settleProgress.Time, settleProgress.SettleTime, settleProgress.StarLocked));
-                }
-                break;
-
             case "SettleDone":
-                if (guider.Driver.TryGetSettleProgress(out settleProgress))
+                if (await guider.Driver.GetSettleProgressAsync(cts.Token) is { } settleProgress)
                 {
-                    BroadcastEvent(new SettleDoneEvent(settleProgress.Status, settleProgress.Error ?? "", 0, 0));
+                    if (e.Event is "SettleDone")
+                    {
+                        await BroadcastEventAsync(new SettleDoneEvent(settleProgress.Status, settleProgress.Error ?? "", 0, 0), cts.Token);
+                    }
+                    else if (e.Event is "Settling")
+                    {
+                        await BroadcastEventAsync(new SettlingEvent(settleProgress.Distance, settleProgress.Time, settleProgress.SettleTime, settleProgress.StarLocked), cts.Token);
+                    }
                 }
                 break;
         }
@@ -113,66 +123,43 @@ while (!cts.IsCancellationRequested)
 {
     var client = await listener.AcceptTcpClientAsync(cts.Token);
 
-    Console.WriteLine("Incoming connection from: {0}", client.Client.RemoteEndPoint);
+    if (client.Client.RemoteEndPoint is { } remoteEndpoint)
+    {
+        external.AppLogger.LogInformation("Incoming connection from: {RemoteEndpoint}", remoteEndpoint);
 
-    new Thread(Worker).Start(client);
+        var stream = client.GetStream();
+        clients[remoteEndpoint] = (ClientWorkerAsync(stream, remoteEndpoint), stream, client);
+    }
 }
 
-void Worker(object? obj)
+await host.WaitForShutdownAsync();
+
+async Task ClientWorkerAsync(NetworkStream stream, EndPoint endPoint)
 {
-    if (obj is not TcpClient client)
-    {
-        Console.Error.WriteLine("State is not a TCP client");
-        return;
-    }
-
-    var endPoint = client.Client.RemoteEndPoint;
-    if (endPoint is null)
-    {
-        Console.Error.WriteLine("Invalid client");
-        return;
-    }
-
-    using var stream = client.GetStream();
-    using var reader = new StreamReader(stream, Encoding.UTF8, leaveOpen: true);
+    using var reader = new StreamReader(stream, Encoding.UTF8);
 
     var version = guider.Driver.DriverInfo?.Split(' ', StringSplitOptions.RemoveEmptyEntries).Skip(1) ?? [];
 
-    SendEvent(stream, new VersionEvent(version.FirstOrDefault() ?? "Unknown", version.LastOrDefault() ?? "Unknown"), endPoint);
+    await SendEventAsync(stream, new VersionEvent(version.FirstOrDefault() ?? "Unknown", version.LastOrDefault() ?? "Unknown"), endPoint, cts.Token);
 
-    switch (appState)
+    await (appState switch
     {
-        case "Stopped":     // PHD is idle
-            SendEvent(stream, new LoopingExposuresStoppedEvent(), endPoint);
-            break;
-        case "Selected":    // A star is selected but PHD is neither looping exposures, calibrating, or guiding
-            SendEvent(stream, new StarSelectedEvent(), endPoint);
-            break;
-        case "Calibrating": // PHD is calibrating
-            SendEvent(stream, new StartCalibrationEvent(), endPoint);
-            break;
-        case "Guiding":     // PHD is guiding
-            SendEvent(stream, new StartGuidingEvent(), endPoint);
-            break;
-        case "LostLock":    // PHD is guiding, but the frame was dropped
-            SendEvent(stream, new StarLostEvent(), endPoint);
-            break;
-        case "Paused":      // PHD is paused
-            SendEvent(stream, new PausedEvent(), endPoint);
-            break;
-        case "Looping":     // PHD is looping exposures
-            SendEvent(stream, new LoopingExposuresEvent(), endPoint);
-            break;
-    }
+        "Stopped" => SendEventAsync(stream, new LoopingExposuresStoppedEvent(), endPoint, cts.Token), // PHD is idle
+        "Selected" => SendEventAsync(stream, new StarSelectedEvent(), endPoint, cts.Token), // A star is selected but PHD is neither looping exposures, calibrating, or guiding
+        "Calibrating" => SendEventAsync(stream, new StartCalibrationEvent(), endPoint, cts.Token),  // PHD is calibrating
+        "Guiding" => SendEventAsync(stream, new StartGuidingEvent(), endPoint, cts.Token), // PHD is guiding
+        "LostLock" => SendEventAsync(stream, new StarLostEvent(), endPoint, cts.Token), // PHD is guiding, but the frame was dropped
+        "Paused" => SendEventAsync(stream, new PausedEvent(), endPoint, cts.Token), // PHD is paused
+        "Looping" => SendEventAsync(stream, new LoopingExposuresEvent(), endPoint, cts.Token), // PHD is looping exposures
+        _ => throw new InvalidOperationException($"Unknown PHD2 state {appState}")
+    });
 
-    SendEvent(stream, new AppStateEvent(appState ?? "Unknown"), endPoint);
-
-    clients[endPoint] = stream;
+    await SendEventAsync(stream, new AppStateEvent(appState ?? "Unknown"), endPoint, cts.Token);
 
     try
     {
         string? line;
-        while (!cts.IsCancellationRequested && (line = reader.ReadLine()) != null)
+        while (!cts.IsCancellationRequested && (line = await reader.ReadLineAsync()) != null)
         {
             Console.WriteLine("<< {0} from {1}", line, endPoint);
             var ditherCmd = JsonSerializer.Deserialize<DitherRPC>(line, serializerOptions);
@@ -184,61 +171,62 @@ void Worker(object? obj)
                 {
                     if (Interlocked.CompareExchange(ref ditherReceived, 0, count) == count)
                     {
-                        Console.WriteLine("All {0} connected clients issued a dither command, actually dither now", count);
-                        guider.Driver.Dither(@params.Amount, @params.Settle.Pixels, @params.Settle.Time, @params.Settle.Timeout, @params.RaOnly);
+                        external.AppLogger.LogInformation("All {ClientCOunt} connected clients issued a dither command, actually dither now", count);
+                        await guider.Driver.DitherAsync(@params.Amount, @params.Settle.Pixels, @params.Settle.Time, @params.Settle.Timeout, @params.RaOnly, cts.Token);
                     }
                     else
                     {
-                        Console.WriteLine("Dithering already triggered in another thread");
+                        external.AppLogger.LogWarning("Dithering already triggered in another thread");
                     }
                 }
                 else
                 {
-                    Console.WriteLine("Only {0} of {1} connected clients issued a dither command, ignoring", prev, count);
+                    external.AppLogger.LogInformation("Only {DitherIssued} of {ClientCount} connected clients issued a dither command, ignoring", prev, count);
                 }
             }
         }
     }
     finally
     {
-        Console.WriteLine("Client {0} disconnected", endPoint);
-        clients.TryRemove(endPoint, out _);
+        external.AppLogger.LogInformation("Client {ClientEndpoint} disconnected", endPoint);
+        if (clients.TryRemove(endPoint, out var clientInfo) && clientInfo is { Client: var client })
+        {
+            client.Close();
+        }
     }
 }
 
-void BroadcastEvent<TEvent>(TEvent @event) where TEvent : PHPEvent
+async Task BroadcastEventAsync<TEvent>(TEvent @event, CancellationToken cancellationToken) where TEvent : PHDEvent
 {
-    foreach (var client in clients)
+    await Parallel.ForEachAsync(clients, cancellationToken, async (kv, cancellationToken) =>
     {
-        SendEvent(client.Value, @event, client.Key);
-    }
+        await SendEventAsync(kv.Value.Stream, @event, kv.Key, cancellationToken);
+    });
 }
 
-void SendEvent<TEvent>(Stream stream, TEvent @event, EndPoint endPoint) where TEvent : PHPEvent
+async Task SendEventAsync<TEvent>(Stream stream, TEvent @event, EndPoint endPoint, CancellationToken cancellationToken) where TEvent : PHDEvent
 {
-    var json = JsonSerializer.Serialize(@event, serializerOptions);
-    var jsonl = json + "\r\n";
-    Console.WriteLine(">> {0} to {1}", json, endPoint);
-    stream.Write(Encoding.UTF8.GetBytes(jsonl));
+    await JsonSerializer.SerializeAsync(stream, @event, serializerOptions, cancellationToken);
+    await stream.WriteAsync(CRLF, cancellationToken);
 }
 
-record PHPEvent(string Event, string? Host = "localhost", int MsgVersion = 1, int? Inst = 1);
+record PHDEvent(string Event, string? Host = "localhost", int MsgVersion = 1, int? Inst = 1);
 
-record VersionEvent(string PHPVersion, string PHPSubVer, bool OverlapSupport = true) : PHPEvent("Version");
-record AppStateEvent(string State) : PHPEvent("AppState");
-record LoopingExposuresEvent() : PHPEvent("LoopingExposures");
-record LoopingExposuresStoppedEvent() : PHPEvent("LoopingExposuresStopped");
-record PausedEvent() : PHPEvent("Paused");
-record StarLostEvent() : PHPEvent("StarLost");
-record StartCalibrationEvent() : PHPEvent("StartCalibration");
-record StarSelectedEvent() : PHPEvent("StarSelected");
-record StartGuidingEvent() : PHPEvent("StartGuiding");
-record LockPositionSetEvent() : PHPEvent("LockPositionSet");
-record GuideStepEvent(double RADistanceRaw, double DECDistanceRaw) : PHPEvent("GuideStep");
-record SettleDoneEvent(int Status, string Error, int TotalFrames, int DroppedFrames) : PHPEvent("SettleDone");
-record SettleBeginEvent() : PHPEvent("SettleBegin");
-record GuidingDitheredEvent(/* double dx, double dy */) : PHPEvent("GuidingDithered");
-record SettlingEvent(double Distance, double Time, double SettleTime, bool StarLocked) : PHPEvent("Settling");
+record VersionEvent(string PHPVersion, string PHPSubVer, bool OverlapSupport = true) : PHDEvent("Version");
+record AppStateEvent(string State) : PHDEvent("AppState");
+record LoopingExposuresEvent() : PHDEvent("LoopingExposures");
+record LoopingExposuresStoppedEvent() : PHDEvent ("LoopingExposuresStopped");
+record PausedEvent() : PHDEvent("Paused");
+record StarLostEvent() : PHDEvent("StarLost");
+record StartCalibrationEvent() : PHDEvent("StartCalibration");
+record StarSelectedEvent() : PHDEvent("StarSelected");
+record StartGuidingEvent() : PHDEvent("StartGuiding");
+record LockPositionSetEvent() : PHDEvent("LockPositionSet");
+record GuideStepEvent(double RADistanceRaw, double DECDistanceRaw) : PHDEvent("GuideStep");
+record SettleDoneEvent(int Status, string Error, int TotalFrames, int DroppedFrames) : PHDEvent("SettleDone");
+record SettleBeginEvent() : PHDEvent("SettleBegin");
+record GuidingDitheredEvent(/* double dx, double dy */) : PHDEvent("GuidingDithered");
+record SettlingEvent(double Distance, double Time, double SettleTime, bool StarLocked) : PHDEvent("Settling");
 
 
 // {"method":"dither","params":{"amount":20.0,"settle":{"pixels":2.0,"time":5.0,"timeout":80.0},"raOnly":true},"id":1}
