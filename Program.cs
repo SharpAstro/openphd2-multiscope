@@ -27,9 +27,9 @@ builder.Services
     .AddDeviceManager();
 
 var startListenerSem = new SemaphoreSlim(0);
-string? appState = null;
+var sharedState = new SharedState();
 var serializerOptions = new JsonSerializerOptions { WriteIndented = false };
-var ditherReceived = 0;
+var phdEventJsonContent = new PHDEventJsonContext(serializerOptions);
 
 using var host = builder.Build();
 
@@ -50,27 +50,36 @@ Guider guider;
 if (device is GuiderDevice guiderDevice)
 {
     guider = new Guider(guiderDevice, external);
-    await guider.Driver.ConnectAsync(cts.Token);
+    guider.Driver.DeviceConnectedEvent += GuiderDriver_DeviceConnectedEvent;
     guider.Driver.GuiderStateChangedEvent += GuiderDriver_GuiderStateChangedEvent;
+    guider.Driver.GuidingErrorEvent += GuiderDriver_GuidingErrorEvent;
+
+    await guider.Driver.ConnectAsync(cts.Token);
 }
 else
 {
     throw new InvalidOperationException("Could not connect to guider");
 }
 
+void GuiderDriver_DeviceConnectedEvent(object? sender, DeviceConnectedEventArgs e)
+{
+    external.AppLogger.LogInformation("Guider {DeviceName} {YesOrNo}", (sender as IGuider)?.Name, e.Connected ? "connected" : "disconnected");
+}
+
+void GuiderDriver_GuidingErrorEvent(object? sender, GuidingErrorEventArgs e)
+{
+    external.AppLogger.LogError(e.Exception, "Guider {DeviceName} encountered error {ErrorMessage}", e.Device.DisplayName, e.Message);
+}
+
 async void GuiderDriver_GuiderStateChangedEvent(object? sender, GuiderStateChangedEventArgs e)
 {
-    if (e.AppState is { } state)
+    if (e.AppState is { Length: > 0 } state && state is not SharedState.UnknownState && sharedState.SetState(state) is { } orig && orig != state)
     {
-        var orig = Interlocked.Exchange(ref appState, state);
-        if (orig != state)
-        {
-            Console.WriteLine("Guider in state = {0} on event = {1}", state, e.Event);
-        }
+        external.AppLogger.LogInformation("Guider in state = {NewState} (was {OrigState}) on event = {EventName}", state, orig ?? "Unknown", e.Event);
     }
     else
     {
-        Console.WriteLine("Event = {0}", e.Event);
+        external.AppLogger.LogInformation("Event = {EventName}", e.Event);
     }
 
     if (startListenerSem.CurrentCount == 0)
@@ -81,6 +90,18 @@ async void GuiderDriver_GuiderStateChangedEvent(object? sender, GuiderStateChang
     {
         switch (e.Event)
         {
+            case "ConfigurationChange":
+                await BroadcastEventAsync(new ConfigurationChangeEvent(), cts.Token);
+                break;
+
+            case "Calibrating":
+                await BroadcastEventAsync(new CalibratingEvent(), cts.Token);
+                break;
+
+            case "CalibrationComplete":
+                await BroadcastEventAsync(new CalibrationCompleteEvent(), cts.Token);
+                break;
+
             case "GuideStep":
                 if (await guider.Driver.GetStatsAsync(cts.Token) is { LastRaErr: { } ra, LastDecErr: { } dec } stats)
                 {
@@ -110,6 +131,50 @@ async void GuiderDriver_GuiderStateChangedEvent(object? sender, GuiderStateChang
                     }
                 }
                 break;
+
+            case "LockPositionSet":
+                await BroadcastEventAsync(new LockPositionSetEvent(), cts.Token);
+                break;
+
+            case "LockPositionLost":
+                await BroadcastEventAsync(new LockPositionLostEvent(), cts.Token);
+                break;
+
+            case "AppState":
+                await BroadcastEventAsync(new AppStateEvent(e.AppState ?? "Unknown"), cts.Token);
+                break;
+
+            case "Paused":
+                await BroadcastEventAsync(new PausedEvent(), cts.Token);
+                break;
+
+            case "StarLost":
+                await BroadcastEventAsync(new StarLostEvent(), cts.Token);
+                break;
+
+            case "LoopingExposures":
+                await BroadcastEventAsync(new LoopingExposuresEvent(), cts.Token);
+                break;
+
+            case "StarSelected":
+                await BroadcastEventAsync(new StarSelectedEvent(), cts.Token);
+                break;
+
+            case "StartGuiding":
+                await BroadcastEventAsync(new StartGuidingEvent(), cts.Token);
+                break;
+
+            case "GuidingStopped":
+                await BroadcastEventAsync(new GuidingStoppedEvent(), cts.Token);
+                break;
+
+            case "LoopingExposuresStopped":
+                await BroadcastEventAsync(new LoopingExposuresStoppedEvent(), cts.Token);
+                break;
+
+            default:
+                external.AppLogger.LogWarning("Unhandled event = {EventName}", e.Event);
+                break;
         }
     }
 }
@@ -119,7 +184,7 @@ using var listener = new TcpListener(IPAddress.Loopback, 4410);
 await startListenerSem.WaitAsync(cts.Token);
 listener.Start();
 
-while (!cts.IsCancellationRequested)
+while (!cts.IsCancellationRequested && guider.Driver.Connected)
 {
     var client = await listener.AcceptTcpClientAsync(cts.Token);
 
@@ -142,6 +207,7 @@ async Task ClientWorkerAsync(NetworkStream stream, EndPoint endPoint)
 
     await SendEventAsync(stream, new VersionEvent(version.FirstOrDefault() ?? "Unknown", version.LastOrDefault() ?? "Unknown"), endPoint, cts.Token);
 
+    var appState = sharedState.AppState;
     await (appState switch
     {
         "Stopped" => SendEventAsync(stream, new LoopingExposuresStoppedEvent(), endPoint, cts.Token), // PHD is idle
@@ -159,17 +225,18 @@ async Task ClientWorkerAsync(NetworkStream stream, EndPoint endPoint)
     try
     {
         string? line;
-        while (!cts.IsCancellationRequested && (line = await reader.ReadLineAsync()) != null)
+        while (guider.Driver.Connected && !cts.IsCancellationRequested && (line = await reader.ReadLineAsync(cts.Token)) != null)
         {
-            Console.WriteLine("<< {0} from {1}", line, endPoint);
-            var ditherCmd = JsonSerializer.Deserialize<DitherRPC>(line, serializerOptions);
+            var ditherCmd = JsonSerializer.Deserialize(line, PHDJsonRPCJsonContext.Default.DitherRPC);
             if (ditherCmd?.Params is { } @params)
             {
+                external.AppLogger.LogInformation("Recieved dithering command {@Params} from {RemoteEndpoint}", @params, endPoint);
+
                 var count = clients.Count;
-                var prev = Interlocked.Increment(ref ditherReceived);
+                var prev = sharedState.IncrementDitherReceived();
                 if (prev == count)
                 {
-                    if (Interlocked.CompareExchange(ref ditherReceived, 0, count) == count)
+                    if (sharedState.AllDitherReceived(count))
                     {
                         external.AppLogger.LogInformation("All {ClientCOunt} connected clients issued a dither command, actually dither now", count);
                         await guider.Driver.DitherAsync(@params.Amount, @params.Settle.Pixels, @params.Settle.Time, @params.Settle.Timeout, @params.RaOnly, cts.Token);
@@ -183,6 +250,10 @@ async Task ClientWorkerAsync(NetworkStream stream, EndPoint endPoint)
                 {
                     external.AppLogger.LogInformation("Only {DitherIssued} of {ClientCount} connected clients issued a dither command, ignoring", prev, count);
                 }
+            }
+            else
+            {
+                external.AppLogger.LogWarning("Received unknown command {Line} from {RemoteEndpoint}", line, endPoint);
             }
         }
     }
@@ -198,39 +269,104 @@ async Task ClientWorkerAsync(NetworkStream stream, EndPoint endPoint)
 
 async Task BroadcastEventAsync<TEvent>(TEvent @event, CancellationToken cancellationToken) where TEvent : PHDEvent
 {
+    var failedClients = new ConcurrentBag<EndPoint>();
     await Parallel.ForEachAsync(clients, cancellationToken, async (kv, cancellationToken) =>
     {
-        await SendEventAsync(kv.Value.Stream, @event, kv.Key, cancellationToken);
+        try
+        {
+            await SendEventAsync(kv.Value.Stream, @event, kv.Key, cancellationToken);
+        }
+        catch (Exception ex)
+        {
+            external.AppLogger.LogError(ex, "Error while boradcasting event {EventTYpe} to {ClientEndpoint}", typeof(TEvent), kv.Key);
+            failedClients.Add(kv.Key);
+        }
     });
+
+    foreach (var failedClient in failedClients)
+    {
+        _ = clients.TryRemove(failedClient, out _);
+    }
 }
 
 async Task SendEventAsync<TEvent>(Stream stream, TEvent @event, EndPoint endPoint, CancellationToken cancellationToken) where TEvent : PHDEvent
 {
-    await JsonSerializer.SerializeAsync(stream, @event, serializerOptions, cancellationToken);
+    await JsonSerializer.SerializeAsync(stream, @event, typeof(TEvent), phdEventJsonContent, cancellationToken);
     await stream.WriteAsync(CRLF, cancellationToken);
 }
 
-record PHDEvent(string Event, string? Host = "localhost", int MsgVersion = 1, int? Inst = 1);
+class SharedState
+{
+    internal const string UnknownState = "Unknown";
 
-record VersionEvent(string PHPVersion, string PHPSubVer, bool OverlapSupport = true) : PHDEvent("Version");
-record AppStateEvent(string State) : PHDEvent("AppState");
-record LoopingExposuresEvent() : PHDEvent("LoopingExposures");
-record LoopingExposuresStoppedEvent() : PHDEvent ("LoopingExposuresStopped");
-record PausedEvent() : PHDEvent("Paused");
-record StarLostEvent() : PHDEvent("StarLost");
-record StartCalibrationEvent() : PHDEvent("StartCalibration");
-record StarSelectedEvent() : PHDEvent("StarSelected");
-record StartGuidingEvent() : PHDEvent("StartGuiding");
-record LockPositionSetEvent() : PHDEvent("LockPositionSet");
-record GuideStepEvent(double RADistanceRaw, double DECDistanceRaw) : PHDEvent("GuideStep");
-record SettleDoneEvent(int Status, string Error, int TotalFrames, int DroppedFrames) : PHDEvent("SettleDone");
-record SettleBeginEvent() : PHDEvent("SettleBegin");
-record GuidingDitheredEvent(/* double dx, double dy */) : PHDEvent("GuidingDithered");
-record SettlingEvent(double Distance, double Time, double SettleTime, bool StarLocked) : PHDEvent("Settling");
+    private string _appState = UnknownState;
+    private int _ditherReceived = 0;
 
+    public int IncrementDitherReceived() => Interlocked.Increment(ref _ditherReceived);
+
+    public bool AllDitherReceived(int count) => Interlocked.CompareExchange(ref _ditherReceived, 0, count) == count;
+
+    internal string AppState => Interlocked.CompareExchange(ref _appState, UnknownState, UnknownState);
+
+    internal string SetState(string state) => Interlocked.Exchange(ref _appState, state);
+}
+
+[JsonSerializable(typeof(PHDEvent))]
+[JsonSerializable(typeof(ConfigurationChangeEvent))]
+[JsonSerializable(typeof(CalibratingEvent))]
+[JsonSerializable(typeof(CalibrationCompleteEvent))]
+[JsonSerializable(typeof(GuideStepEvent))]
+[JsonSerializable(typeof(GuidingDitheredEvent))]
+[JsonSerializable(typeof(SettleBeginEvent))]
+[JsonSerializable(typeof(SettleDoneEvent))]
+[JsonSerializable(typeof(SettlingEvent))]
+[JsonSerializable(typeof(LockPositionSetEvent))]
+[JsonSerializable(typeof(LockPositionLostEvent))]
+[JsonSerializable(typeof(AppStateEvent))]
+[JsonSerializable(typeof(PausedEvent))]
+[JsonSerializable(typeof(StarLostEvent))]
+[JsonSerializable(typeof(LoopingExposuresEvent))]
+[JsonSerializable(typeof(StarSelectedEvent))]
+[JsonSerializable(typeof(StartGuidingEvent))]
+[JsonSerializable(typeof(GuidingStoppedEvent))]
+[JsonSerializable(typeof(LoopingExposuresStoppedEvent))]
+[JsonSerializable(typeof(VersionEvent))]
+internal partial class PHDEventJsonContext : JsonSerializerContext
+{
+}
+
+internal record PHDEvent(string Event, string? Host = "localhost", int MsgVersion = 1, int? Inst = 1);
+
+internal record VersionEvent(string PHPVersion, string PHPSubVer, bool OverlapSupport = true) : PHDEvent("Version");
+internal record AppStateEvent(string State) : PHDEvent("AppState");
+internal record LoopingExposuresEvent() : PHDEvent("LoopingExposures");
+internal record LoopingExposuresStoppedEvent() : PHDEvent ("LoopingExposuresStopped");
+internal record PausedEvent() : PHDEvent("Paused");
+internal record StarLostEvent() : PHDEvent("StarLost");
+internal record StartCalibrationEvent() : PHDEvent("StartCalibration");
+internal record ConfigurationChangeEvent() :PHDEvent("ConfigurationChangeEvent");
+internal record CalibratingEvent() : PHDEvent("Calibrating");
+internal record CalibrationCompleteEvent() : PHDEvent("CalibrationComplete");
+internal record StarSelectedEvent() : PHDEvent("StarSelected");
+internal record StartGuidingEvent() : PHDEvent("StartGuiding");
+internal record LockPositionSetEvent() : PHDEvent("LockPositionSet");
+internal record LockPositionLostEvent() : PHDEvent("LockPositionLost");
+internal record GuidingStoppedEvent() : PHDEvent("GuidingStopped");
+internal record GuideStepEvent(double RADistanceRaw, double DECDistanceRaw) : PHDEvent("GuideStep");
+internal record SettleDoneEvent(int Status, string Error, int TotalFrames, int DroppedFrames) : PHDEvent("SettleDone");
+internal record SettleBeginEvent() : PHDEvent("SettleBegin");
+internal record GuidingDitheredEvent(/* double dx, double dy */) : PHDEvent("GuidingDithered");
+internal record SettlingEvent(double Distance, double Time, double SettleTime, bool StarLocked) : PHDEvent("Settling");
+
+[JsonSerializable(typeof(DitherRPC))]
+[JsonSerializable(typeof(DitherParams))]
+[JsonSerializable(typeof(SettleArg))]
+internal partial class PHDJsonRPCJsonContext : JsonSerializerContext
+{
+}
 
 // {"method":"dither","params":{"amount":20.0,"settle":{"pixels":2.0,"time":5.0,"timeout":80.0},"raOnly":true},"id":1}
-record DitherRPC([property: JsonPropertyName("id")] int Id, [property:JsonPropertyName("method")] string Method, [property: JsonPropertyName("params")] DitherParams Params);
+internal record DitherRPC([property: JsonPropertyName("id")] int Id, [property:JsonPropertyName("method")] string Method, [property: JsonPropertyName("params")] DitherParams Params);
 
-record DitherParams([property: JsonPropertyName("amount")] double Amount, [property: JsonPropertyName("settle")] SettleArg Settle, [property: JsonPropertyName("raOnly")] bool RaOnly);
-record SettleArg([property: JsonPropertyName("pixels")] double Pixels, [property: JsonPropertyName("time")] double Time, [property: JsonPropertyName("timeout")] double Timeout);
+internal record DitherParams([property: JsonPropertyName("amount")] double Amount, [property: JsonPropertyName("settle")] SettleArg Settle, [property: JsonPropertyName("raOnly")] bool RaOnly);
+internal record SettleArg([property: JsonPropertyName("pixels")] double Pixels, [property: JsonPropertyName("time")] double Time, [property: JsonPropertyName("timeout")] double Timeout);
