@@ -7,19 +7,20 @@ on:
     branches: [ "master" ]
 
 jobs:
-  build:
+  build:      
     strategy:
       fail-fast: false
       matrix:
         configuration: [Debug, Release]
-        os: [windows-latest, ubuntu-22.04]
+        os: [windows-latest, ubuntu-24.04, ubuntu-24.04-arm]
         include:
           - os: windows-latest
             native: win-x64
             arm64: win-arm64
-          - os: ubuntu-22.04
+          - os: ubuntu-24.04
             native: linux-x64
-            arm64: linux-arm64
+          - os: ubuntu-24.04-arm
+            native: linux-arm64
 
     runs-on: ${{ matrix.os }}
     steps:
@@ -29,7 +30,7 @@ jobs:
         fetch-depth: 0
 
     - name: Build/Publish app (native)
-      run: dotnet publish -c ${{ matrix.configuration }}
+      run: dotnet publish -c ${{ matrix.configuration }} -r ${{ matrix.native }}
 
     - name: Upload Artifact (native)
       uses: actions/upload-artifact@v4
@@ -38,25 +39,28 @@ jobs:
         path: 'bin/${{ matrix.configuration }}/net8.0/${{ matrix.native }}/publish/'
         retention-days: 5
 
-    - name: Install prerequisites for Linux ARM64 cross-compile
-      run: |
-        sudo dpkg --add-architecture arm64
-        sudo bash -c 'cat > /etc/apt/sources.list.d/arm64.list <<EOF
-        deb [arch=arm64] http://ports.ubuntu.com/ubuntu-ports/ $(lsb_release -sc 2>/dev/null) main restricted
-        deb [arch=arm64] http://ports.ubuntu.com/ubuntu-ports/ $(lsb_release -sc 2>/dev/null)-updates main restricted
-        deb [arch=arm64] http://ports.ubuntu.com/ubuntu-ports/ $(lsb_release -sc 2>/dev/null)-backports main restricted universe multiverse
-        EOF'
-        sudo sed -i -e 's/deb http/deb [arch=amd64] http/g' /etc/apt/sources.list
-        sudo sed -i -e 's/deb mirror/deb [arch=amd64] mirror/g' /etc/apt/sources.list
-        sudo apt-get update
-        sudo apt-get install -y clang llvm binutils-aarch64-linux-gnu gcc-aarch64-linux-gnu zlib1g-dev:arm64
-      if: runner.os == 'Linux'
+#    - name: Install prerequisites for Linux ARM64 cross-compile
+#      if: runner.os == 'Linux'
+#      run: |
+#        sudo dpkg --add-architecture arm64
+#        sudo bash -c 'cat > /etc/apt/sources.list.d/arm64.list <<EOF
+#        deb [arch=arm64] http://ports.ubuntu.com/ubuntu-ports/ $(lsb_release -sc 2>/dev/null) main restricted
+#        deb [arch=arm64] http://ports.ubuntu.com/ubuntu-ports/ $(lsb_release -sc 2>/dev/null)-updates main restricted
+#        deb [arch=arm64] http://ports.ubuntu.com/ubuntu-ports/ $(lsb_release -sc 2>/dev/null)-backports main restricted universe multiverse
+#        EOF'
+#        sudo sed -i -e 's/deb http/deb [arch=amd64] http/g' /etc/apt/sources.list
+#        sudo sed -i -e 's/deb mirror/deb [arch=amd64] mirror/g' /etc/apt/sources.list
+#        sudo apt-get update
+#        sudo apt-get install -y clang llvm binutils-aarch64-linux-gnu gcc-aarch64-linux-gnu zlib1g-dev:arm64
+
 
     - name: Build/Publish app (arm64)
       run: dotnet publish -c ${{ matrix.configuration }} -r ${{ matrix.arm64 }}
+      if: runner.os == 'Windows'
 
     - name: Upload Artifact (arm64)
       uses: actions/upload-artifact@v4
+      if: runner.os == 'Windows'
       with:
         name: OpenPHD2-MultiScope-${{ matrix.configuration }}-${{ matrix.arm64 }}
         path: 'bin/${{ matrix.configuration }}/net8.0/${{ matrix.arm64 }}/publish/'
