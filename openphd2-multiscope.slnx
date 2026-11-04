@@ -1,0 +1,4 @@
+<Solution>
+  <Project Path="src/OpenPHD2MultiScope/OpenPHD2MultiScope.csproj" />
+  <Project Path="src/OpenPHD2MultiScope.Tests/OpenPHD2MultiScope.Tests.csproj" />
+</Solution>

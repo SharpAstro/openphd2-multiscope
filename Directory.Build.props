@@ -1,0 +1,36 @@
+<Project>
+
+  <PropertyGroup>
+    <!-- THE version for this repo, and the only place it is written. CI reads it back
+         (dotnet msbuild -getProperty:VersionMajorMinor) and appends the run number, so a release
+         bump is this one line. 2.0: net10, TianWen.Lib 10, and a proxy that answers every request. -->
+    <VersionMajorMinor>2.0</VersionMajorMinor>
+    <!-- Local builds get Major.Minor.0; CI passes -p:Version=Major.Minor.<run><attempt>+<sha>, and
+         the condition lets it win. -->
+    <VersionPrefix Condition="'$(VersionPrefix)' == ''">$(VersionMajorMinor).0</VersionPrefix>
+    <Deterministic>true</Deterministic>
+    <ContinuousIntegrationBuild Condition="'$(GITHUB_ACTIONS)' == 'true'">true</ContinuousIntegrationBuild>
+    <LangVersion>latest</LangVersion>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
+  </PropertyGroup>
+
+  <PropertyGroup>
+    <CreateHardLinksForCopyLocalIfPossible>true</CreateHardLinksForCopyLocalIfPossible>
+    <CreateHardLinksForCopyFilesToOutputDirectoryIfPossible>true</CreateHardLinksForCopyFilesToOutputDirectoryIfPossible>
+    <CreateHardLinksForCopyAdditionalFilesIfPossible>true</CreateHardLinksForCopyAdditionalFilesIfPossible>
+    <CreateHardLinksForAdditionalFilesIfPossible>true</CreateHardLinksForAdditionalFilesIfPossible>
+    <CreateHardLinksForPublishFilesIfPossible>true</CreateHardLinksForPublishFilesIfPossible>
+  </PropertyGroup>
+
+  <PropertyGroup>
+    <!-- This proxy doubles as a test driver for TianWen's PHD2 driver, so with the tianwen clone
+         beside this one it builds against TianWen.Lib's SOURCE (the org's UseLocal* pattern). CI has
+         no sibling and restores the package. Reproduce CI with:
+           dotnet build -c Release -p:UseLocalTianWen=false
+         The path is relative to THIS file, at the repo root, so one .. is the org root. -->
+    <UseLocalTianWen Condition="'$(UseLocalTianWen)' == '' AND Exists('$(MSBuildThisFileDirectory)..\tianwen\src\TianWen.Lib\TianWen.Lib.csproj')">true</UseLocalTianWen>
+  </PropertyGroup>
+
+</Project>

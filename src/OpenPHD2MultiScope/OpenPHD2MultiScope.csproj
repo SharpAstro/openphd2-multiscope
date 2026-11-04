@@ -1,0 +1,30 @@
+﻿<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0</TargetFramework>
+    <RootNamespace>TianWen.OpenPHD2MultiScope</RootNamespace>
+    <AssemblyName>openphd2-multiscope</AssemblyName>
+    <PublishAot>true</PublishAot>
+    <InvariantGlobalization>true</InvariantGlobalization>
+    <!-- A release is the executable alone, not the references' XML docs. -->
+    <PublishReferencesDocumentationFiles>false</PublishReferencesDocumentationFiles>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <InternalsVisibleTo Include="OpenPHD2MultiScope.Tests" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.Extensions.Hosting" />
+  </ItemGroup>
+
+  <ItemGroup Condition="'$(UseLocalTianWen)' == 'true'">
+    <ProjectReference Include="..\..\..\tianwen\src\TianWen.Lib\TianWen.Lib.csproj" />
+  </ItemGroup>
+
+  <ItemGroup Condition="'$(UseLocalTianWen)' != 'true'">
+    <PackageReference Include="TianWen.Lib" />
+  </ItemGroup>
+
+</Project>
