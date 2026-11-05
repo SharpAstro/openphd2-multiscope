@@ -65,3 +65,17 @@ dotnet publish src/OpenPHD2MultiScope -c Release -r win-x64    # one native exec
 
 With a clone of `tianwen` next to this one, the build uses TianWen.Lib's source; otherwise the
 `TianWen.Lib` package. `-p:UseLocalTianWen=false` builds against the package as CI does.
+
+### End-to-end checks against a real PHD2
+
+`tests/e2e/e2e.py` connects two clients to the proxy in front of a real PHD2 using its simulator
+camera and mount, and checks the greeting, the queries, guiding, that a dither waits for both
+clients and happens once, and that a stop waits for both. CI runs it on every push, before
+publishing, through `tests/e2e/run.sh` (Linux: PHD2 on a virtual screen, with the profile in
+`tests/e2e/phd2-simulator.cfg`).
+
+To run it by hand, start PHD2 with a simulator profile and "Enable Server" on, run the proxy, and:
+
+```
+python tests/e2e/e2e.py 4410
+```

@@ -32,8 +32,7 @@ builder.Services
         console.IncludeScopes = false;
         console.TimestampFormat = "HH:mm:ss ";
     }))
-    .AddExternal()
-    .AddPHD2();
+    .AddProxyServices();
 
 using var host = builder.Build();
 await host.StartAsync();
@@ -43,7 +42,7 @@ var lifetime = host.Services.GetRequiredService<IHostApplicationLifetime>();
 
 // Addressed directly rather than discovered: discovery would pick whichever PHD2 answers first,
 // and the user named one.
-var device = new OpenPHD2GuiderDevice(DeviceType.Guider, $"{options.Phd2Host}/{options.Phd2Instance}", $"PHD2 #{options.Phd2Instance} on {options.Phd2Host}");
+var device = ProxyComposition.GuiderDevice(options);
 if (!device.TryInstantiateDriver<IGuider>(host.Services, out var guider))
 {
     logger.LogCritical("TianWen.Lib could not create a PHD2 driver for {Device}", device);

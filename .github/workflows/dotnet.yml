@@ -39,8 +39,44 @@ jobs:
     - name: Test
       run: dotnet test --project src/OpenPHD2MultiScope.Tests -c $BUILD_CONF --no-build
 
+  # Two clients against the proxy in front of a real PHD2 (its simulator camera and mount, on a
+  # virtual screen): greeting, queries, calibrating and guiding, one shared dither, a shared stop.
+  # See tests/e2e/run.sh. About 5 minutes, most of it the simulator calibrating.
+  e2e:
+    runs-on: ubuntu-latest
+    # PHD2's package needs libindi1, and the INDI package source only builds it for Ubuntu 26.04
+    # (resolute) now, so the job runs in a 26.04 container rather than on the 24.04 runner.
+    container: ubuntu:26.04
+    timeout-minutes: 20
+    steps:
+    - name: Install PHD2, a virtual screen and the build prerequisites
+      env:
+        DEBIAN_FRONTEND: noninteractive
+      run: |
+        apt-get update
+        apt-get install -y --no-install-recommends software-properties-common gpg-agent ca-certificates curl git libicu-dev python3
+        add-apt-repository -y ppa:mutlaqja/ppa
+        add-apt-repository -y ppa:pch/phd2
+        apt-get update
+        apt-get install -y --no-install-recommends phd2 xvfb imagemagick
+    - uses: actions/checkout@v7
+    - uses: actions/setup-dotnet@v6
+      with:
+        dotnet-version: 10.0.x
+    - name: Build
+      run: dotnet build src/OpenPHD2MultiScope -c $BUILD_CONF
+    - name: End-to-end checks
+      run: bash tests/e2e/run.sh src/OpenPHD2MultiScope/bin/$BUILD_CONF/net10.0/openphd2-multiscope e2e-logs
+    - name: Upload logs (PHD2's, the proxy's, a screenshot)
+      if: always()
+      uses: actions/upload-artifact@v7
+      with:
+        name: e2e-logs
+        path: e2e-logs
+        retention-days: 5
+
   publish:
-    needs: build
+    needs: [ build, e2e ]
     strategy:
       fail-fast: false
       matrix:
