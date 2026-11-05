@@ -33,9 +33,6 @@ builder.Services
         console.TimestampFormat = "HH:mm:ss ";
     }))
     .AddExternal()
-    // IExternal's implementation takes an ICelestialObjectDB, which only AddAstrometry registers;
-    // nothing here reads a catalogue, and the singletons it adds are built only when asked for.
-    .AddAstrometry()
     .AddPHD2();
 
 using var host = builder.Build();
