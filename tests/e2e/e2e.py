@@ -124,9 +124,14 @@ check("dither happened: A sees SettleDone", a.wait_event("SettleDone", after=mar
 check("dither happened: B sees SettleDone", b.wait_event("SettleDone", after=mark_b, timeout=180))
 check("exactly one dither (one SettleBegin)", a.event_names()[mark_a:].count("SettleBegin") == 1)
 
+mark_a = len(a.event_names())
 a.call("stop_capture")
 time.sleep(3)
-check("A alone cannot stop guiding", a.call("get_app_state").get("result") == "Guiding")
+# Judged by the event, not only the state: the simulator loses its star now and then, and PHD2
+# reports "LostLock" while it is still guiding.
+check("A alone cannot stop guiding",
+      "GuidingStopped" not in a.event_names()[mark_a:]
+      and a.call("get_app_state").get("result") in ("Guiding", "LostLock"))
 # B leaves (shutdown: close() alone leaves the socket open while makefile() holds it),
 # so the stop A asked for now has everyone it needs.
 b.sock.shutdown(socket.SHUT_RDWR)
