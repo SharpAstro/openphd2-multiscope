@@ -147,6 +147,8 @@ jobs:
         echo "VERSION_PREFIX=${MM}.${{ github.run_number }}" >> "$GITHUB_ENV"
     - uses: actions/download-artifact@v8
       with:
+        # Only the archives: the run also holds e2e-logs, which is not for the release.
+        pattern: openphd2-multiscope-*
         path: dist
         merge-multiple: true
     - name: Create GitHub release
